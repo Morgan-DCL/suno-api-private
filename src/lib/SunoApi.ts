@@ -26,10 +26,105 @@ export const SUNO_MODELS = {
   V4_5_PLUS: 'chirp-bluejay',  // V4.5+ (蓝松鸦)
   V4_5_PRO: 'chirp-auk',        // V4.5 Pro (海雀)
   V5: 'chirp-crow',             // V5 (乌鸦)
+  V5_5: 'chirp-fenix',
 } as const;
 
 // Default to latest version (V5)
 export const DEFAULT_MODEL = SUNO_MODELS.V5;
+
+export const resolveSunoModel = (model?: string): string => {
+  if (!model)
+    return DEFAULT_MODEL;
+  const trimmed = model.trim();
+  return (SUNO_MODELS as Record<string, string>)[trimmed] || trimmed;
+};
+
+const authCacheCandidates = [
+  path.resolve(process.cwd(), '.suno_auth_cache.json'),
+  path.resolve(process.cwd(), '..', '.suno_auth_cache.json')
+];
+
+const readSharedAuthCache = async (): Promise<any | undefined> => {
+  for (const cachePath of authCacheCandidates) {
+    try {
+      const raw = await fs.readFile(cachePath, 'utf8');
+      return JSON.parse(raw);
+    } catch (error: any) {
+      if (error?.code !== 'ENOENT')
+        logger.warn({ err: error, cachePath }, 'Unable to read shared Suno auth cache');
+    }
+  }
+  return undefined;
+};
+
+const readSharedSunoCookie = async (): Promise<string | undefined> => {
+  const data = await readSharedAuthCache();
+  if (!data)
+    return undefined;
+  if (typeof data.cookie_header === 'string' && data.cookie_header.length > 0)
+    return data.cookie_header;
+  const token = data.jwt_token || data.bearer_token || data.token;
+  if (typeof token === 'string' && token.length > 100)
+    return `__session=${token}`;
+  return undefined;
+};
+
+const readSharedGenerationToken = async (): Promise<string | null> => {
+  const data = await readSharedAuthCache();
+  if (!data || typeof data.generation_token !== 'string')
+    return null;
+
+  const savedAt = Number(data.generation_token_saved_at || 0);
+  const ageSeconds = Date.now() / 1000 - savedAt;
+  if (!savedAt || ageSeconds > 110) {
+    logger.warn('Shared Suno generation token is missing or too old');
+    return null;
+  }
+
+  return data.generation_token;
+};
+
+const readSharedGenerationHeaders = async (): Promise<Record<string, string>> => {
+  const data = await readSharedAuthCache();
+  const headers = data?.generation_request_headers;
+  if (!headers || typeof headers !== 'object')
+    return {};
+
+  const allowed = [
+    'origin',
+    'referer',
+    'user-agent',
+    'x-suno-client',
+    'x-requested-with',
+    'affiliate-id',
+    'device-id',
+    'session-id'
+  ];
+  const output: Record<string, string> = {};
+  for (const key of allowed) {
+    const value = headers[key];
+    if (typeof value === 'string' && value.length > 0)
+      output[key] = value;
+  }
+  return output;
+};
+
+const mergeWebPayloadTemplate = async (payload: any): Promise<any> => {
+  const data = await readSharedAuthCache();
+  const template = data?.generation_request_payload;
+  if (!template || typeof template !== 'object' || Array.isArray(template))
+    return payload;
+
+  return {
+    ...template,
+    ...payload,
+    metadata: {
+      ...(template.metadata || {}),
+      ...(payload.metadata || {})
+    },
+    transaction_uuid: payload.transaction_uuid
+  };
+};
 
 export interface AudioInfo {
   id: string; // Unique identifier for the audio
@@ -79,7 +174,7 @@ interface PersonaResponse {
 }
 
 class SunoApi {
-  private static BASE_URL: string = 'https://studio-api.prod.suno.com';
+  private static BASE_URL: string = process.env.SUNO_STUDIO_API_BASE_URL || 'https://studio-api-prod.suno.com';
   private static CLERK_BASE_URL: string = 'https://clerk.suno.com';
   private static CLERK_VERSION = '5.15.0';
 
@@ -331,9 +426,13 @@ class SunoApi {
    * @returns {string|null} hCaptcha token. If no verification is required, returns null
    */
   public async getCaptcha(): Promise<string|null> {
-    // 跳过验证码检查，直接返回 null
-    // Suno 现在似乎不强制要求验证码，或者验证码检查本身有问题
-    logger.info('Skipping CAPTCHA check');
+    const sharedGenerationToken = await readSharedGenerationToken();
+    if (sharedGenerationToken) {
+      logger.info('Using shared /api/generate/v2 verification token');
+      return sharedGenerationToken;
+    }
+
+    logger.warn('No fresh shared /api/generate/v2 verification token found');
     return null;
 
     // 原始代码（如果需要恢复验证码功能，取消下面的注释）
@@ -597,9 +696,9 @@ class SunoApi {
     // 生成 session token（模拟浏览器行为）
     const createSessionToken = randomUUID();
 
-    const payload: any = {
+    let payload: any = {
       make_instrumental: make_instrumental,
-      mv: model || DEFAULT_MODEL,
+      mv: resolveSunoModel(model),
       prompt: '',
       generation_type: 'TEXT',
       continue_at: continue_at,
@@ -657,17 +756,40 @@ class SunoApi {
           2
         )
     );
-    const response = await this.client.post(
-      `${SunoApi.BASE_URL}/api/generate/v2/`,
-      payload,
+    payload = await mergeWebPayloadTemplate(payload);
+    const capturedHeaders = await readSharedGenerationHeaders();
+    const postGenerate = (postPayload: any) => this.client.post(
+      `${SunoApi.BASE_URL}/api/generate/v2-web/`,
+      postPayload,
       {
+        headers: capturedHeaders,
         timeout: 10000 // 10 seconds timeout
       }
     );
+    let response;
+    try {
+      response = await postGenerate(payload);
+    } catch (error: any) {
+      const responseText = JSON.stringify(error.response?.data || {});
+      const modelRejected = error.response?.status === 400 && responseText.includes('selected model');
+      if (!modelRejected) {
+        throw error;
+      }
+
+      logger.warn({ mv: payload.mv, response: error.response?.data }, 'Suno rejected selected model, retrying with default model');
+      response = await postGenerate({
+        ...payload,
+        mv: DEFAULT_MODEL
+      });
+    }
     if (response.status !== 200) {
       throw new Error('Error response:' + response.statusText);
     }
-    const songIds = response.data.clips.map((audio: any) => audio.id);
+    const clips = response.data?.clips || response.data?.data?.clips || response.data?.sunoData || response.data;
+    if (!Array.isArray(clips)) {
+      throw new Error('Unexpected generate response: ' + JSON.stringify(response.data));
+    }
+    const songIds = clips.map((audio: any) => audio.id);
     //Want to wait for music file generation
     if (wait_audio) {
       const startTime = Date.now();
@@ -688,22 +810,22 @@ class SunoApi {
       }
       return lastResponse;
     } else {
-      return response.data.clips.map((audio: any) => ({
+      return clips.map((audio: any) => ({
         id: audio.id,
         title: audio.title,
         image_url: audio.image_url,
-        lyric: audio.metadata.prompt,
+        lyric: audio.metadata?.prompt || audio.prompt,
         audio_url: audio.audio_url,
         video_url: audio.video_url,
         created_at: audio.created_at,
         model_name: audio.model_name,
         status: audio.status,
-        gpt_description_prompt: audio.metadata.gpt_description_prompt,
-        prompt: audio.metadata.prompt,
-        type: audio.metadata.type,
-        tags: audio.metadata.tags,
-        negative_tags: audio.metadata.negative_tags,
-        duration: audio.metadata.duration
+        gpt_description_prompt: audio.metadata?.gpt_description_prompt,
+        prompt: audio.metadata?.prompt || audio.prompt,
+        type: audio.metadata?.type,
+        tags: audio.metadata?.tags || audio.tags,
+        negative_tags: audio.metadata?.negative_tags || audio.negative_tags,
+        duration: audio.metadata?.duration || audio.duration
       }));
     }
   }
@@ -914,7 +1036,9 @@ class SunoApi {
 }
 
 export const sunoApi = async (cookie?: string) => {
-  const resolvedCookie = cookie && cookie.includes('__client') ? cookie : process.env.SUNO_COOKIE; // Check for bad `Cookie` header (It's too expensive to actually parse the cookies *here*)
+  const requestCookie = cookie && (cookie.includes('__client') || cookie.includes('__session')) ? cookie : undefined;
+  const cachedCookie = requestCookie ? undefined : await readSharedSunoCookie();
+  const resolvedCookie = requestCookie || cachedCookie || process.env.SUNO_COOKIE; // Check for bad `Cookie` header (It's too expensive to actually parse the cookies *here*)
   if (!resolvedCookie) {
     logger.info('No cookie provided! Aborting...\nPlease provide a cookie either in the .env file or in the Cookie header of your request.')
     throw new Error('Please provide a cookie either in the .env file or in the Cookie header of your request.');
