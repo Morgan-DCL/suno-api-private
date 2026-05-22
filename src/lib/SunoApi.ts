@@ -173,6 +173,26 @@ interface PersonaResponse {
   is_following: boolean;
 }
 
+export interface MyPersona {
+  id: string;
+  name: string;
+  description: string;
+  image_s3_id: string;
+  root_clip_id: string;
+  persona_type: string;
+  is_vox_persona: boolean;
+  is_owned: boolean;
+  is_public: boolean;
+  user_display_name: string;
+  user_handle: string;
+}
+
+export interface MyPersonasResponse {
+  personas: MyPersona[];
+  current_page: number;
+  total_results: number;
+}
+
 class SunoApi {
   private static BASE_URL: string = process.env.SUNO_STUDIO_API_BASE_URL || 'https://studio-api-prod.suno.com';
   private static CLERK_BASE_URL: string = 'https://clerk.suno.com';
@@ -208,7 +228,7 @@ class SunoApi {
     this.client.interceptors.request.use(config => {
       if (this.currentToken && !config.headers.Authorization)
         config.headers.Authorization = `Bearer ${this.currentToken}`;
-      const cookiesArray = Object.entries(this.cookies).map(([key, value]) => 
+      const cookiesArray = Object.entries(this.cookies).map(([key, value]) =>
         cookie.serialize(key, value as string)
       );
       config.headers.Cookie = cookiesArray.join('; ');
@@ -244,7 +264,7 @@ class SunoApi {
   /**
    * Get the clerk package latest version id.
    * This method is commented because we are now using a hard-coded Clerk version, hence this method is not needed.
-   
+
   private async getClerkLatestVersion() {
     // URL to get clerk version ID
     const getClerkVersionUrl = `${SunoApi.JSDELIVR_BASE_URL}/v1/package/npm/@clerk/clerk-js`;
@@ -338,7 +358,7 @@ class SunoApi {
   private async click(target: Locator|Page, position?: { x: number, y: number }): Promise<void> {
     if (this.ghostCursorEnabled) {
       let pos: any = isPage(target) ? { x: 0, y: 0 } : await target.boundingBox();
-      if (position) 
+      if (position)
         pos = {
           ...pos,
           x: pos.x + position.x,
@@ -451,7 +471,7 @@ class SunoApi {
 
     if (this.ghostCursorEnabled)
       this.cursor = await createCursor(page);
-    
+
     logger.info('Triggering the CAPTCHA');
     try {
       await page.getByLabel('Close').click({ timeout: 2000 }); // close all popups
@@ -497,7 +517,7 @@ class SunoApi {
               else
                 throw err;
             }
-          } 
+          }
           if (drag) {
             const challengeBox = await challenge.boundingBox();
             if (challengeBox == null)
@@ -582,7 +602,8 @@ class SunoApi {
     prompt: string,
     make_instrumental: boolean = false,
     model?: string,
-    wait_audio: boolean = false
+    wait_audio: boolean = false,
+    persona_id?: string
   ): Promise<AudioInfo[]> {
     await this.keepAlive(false);
     const startTime = Date.now();
@@ -593,7 +614,12 @@ class SunoApi {
       undefined,
       make_instrumental,
       model,
-      wait_audio
+      wait_audio,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      persona_id
     );
     const costTime = Date.now() - startTime;
     logger.info('Generate Response:\n' + JSON.stringify(audios, null, 2));
@@ -642,7 +668,8 @@ class SunoApi {
     make_instrumental: boolean = false,
     model?: string,
     wait_audio: boolean = false,
-    negative_tags?: string
+    negative_tags?: string,
+    persona_id?: string
   ): Promise<AudioInfo[]> {
     const startTime = Date.now();
     const audios = await this.generateSongs(
@@ -653,7 +680,11 @@ class SunoApi {
       make_instrumental,
       model,
       wait_audio,
-      negative_tags
+      negative_tags,
+      undefined,
+      undefined,
+      undefined,
+      persona_id
     );
     const costTime = Date.now() - startTime;
     logger.info(
@@ -674,7 +705,7 @@ class SunoApi {
    * @param wait_audio Indicates if the method should wait for the audio file to be fully generated before returning.
    * @param negative_tags Negative tags that should not be included in the generated audio.
    * @param task Optional indication of what to do. Enter 'extend' if extending an audio, otherwise specify null.
-   * @param continue_clip_id 
+   * @param continue_clip_id
    * @returns A promise that resolves to an array of AudioInfo objects representing the generated songs.
    */
   private async generateSongs(
@@ -688,7 +719,8 @@ class SunoApi {
     negative_tags?: string,
     task?: string,
     continue_clip_id?: string,
-    continue_at?: number
+    continue_at?: number,
+    persona_id?: string
   ): Promise<AudioInfo[]> {
     await this.keepAlive();
     const captchaToken = await this.getCaptcha();
@@ -727,6 +759,16 @@ class SunoApi {
       continued_aligned_prompt: null,
       transaction_uuid: randomUUID()
     };
+    if (persona_id) {
+      const personaResp = await this.client.get(
+        `${SunoApi.BASE_URL}/api/persona/get-persona/${persona_id}/`,
+        { timeout: 10000 }
+      );
+      payload.task = 'vox';
+      payload.persona_id = persona_id;
+      payload.artist_clip_id = personaResp.data.root_clip_id;
+      payload.override_fields = ['prompt', 'tags'];
+    }
     // 只有当 captcha token 存在时才添加 token 字段
     if (captchaToken) {
       payload.token = captchaToken;
@@ -1018,11 +1060,11 @@ class SunoApi {
 
   public async getPersonaPaginated(personaId: string, page: number = 1): Promise<PersonaResponse> {
     await this.keepAlive(false);
-    
+
     const url = `${SunoApi.BASE_URL}/api/persona/get-persona-paginated/${personaId}/?page=${page}`;
-    
+
     logger.info(`Fetching persona data: ${url}`);
-    
+
     const response = await this.client.get(url, {
       timeout: 10000 // 10 seconds timeout
     });
@@ -1031,6 +1073,18 @@ class SunoApi {
       throw new Error('Error response: ' + response.statusText);
     }
 
+    return response.data;
+  }
+
+  public async getMyPersonas(page: number = 1): Promise<MyPersonasResponse> {
+    await this.keepAlive(false);
+    const response = await this.client.get(
+      `${SunoApi.BASE_URL}/api/persona/get-personas/?page=${page}`,
+      { timeout: 10000 }
+    );
+    if (response.status !== 200) {
+      throw new Error('Error response: ' + response.statusText);
+    }
     return response.data;
   }
 }
